@@ -1,4 +1,4 @@
-from app import app
+from app import APP as app
 
 with app.test_client() as client:
     payload = {
