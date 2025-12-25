@@ -6,6 +6,10 @@ import joblib
 import numpy as np
 from utils import encrypt_text, decrypt_text, mask_card_number, save_image, luhn_check
 from db_mysql import init_db, get_conn
+import time
+from collections import defaultdict
+import threading
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / 'xgboost_oversampled_model.pkl'
@@ -41,6 +45,37 @@ def get_client_ip():
     if request.headers.get('X-Forwarded-For'):
         return request.headers.get('X-Forwarded-For').split(',')[0].strip()
     return request.remote_addr or '0.0.0.0'
+
+
+# Simple in-memory rate limiter per IP (works for single-process)
+_RATE = defaultdict(lambda: {'ts': time.time(), 'count': 0})
+_RATE_LOCK = threading.Lock()
+RATE_LIMIT = int(os.environ.get('RATE_LIMIT', 60))  # requests per minute
+
+
+def check_rate_limit(ip: str):
+    now = time.time()
+    with _RATE_LOCK:
+        rec = _RATE[ip]
+        # reset window every 60s
+        if now - rec['ts'] > 60:
+            rec['ts'] = now
+            rec['count'] = 0
+        rec['count'] += 1
+        if rec['count'] > RATE_LIMIT:
+            return False
+        return True
+
+
+def get_geo_info(ip: str):
+    """Try to fetch simple geo info for an IP using ipapi.co (best-effort)."""
+    try:
+        resp = requests.get(f'https://ipapi.co/{ip}/json/', timeout=2)
+        if resp.ok:
+            return resp.json()
+    except Exception:
+        pass
+    return {}
 
 
 @app.route('/register_user', methods=['POST'])
@@ -88,6 +123,8 @@ def process_payment():
     state = data.get('state','')
 
     client_ip = get_client_ip()
+    if not check_rate_limit(client_ip):
+        return jsonify({'error':'rate_limited'}), 429
     # Check if user exists by user_id or card number
     conn = get_conn()
     try:
@@ -117,8 +154,17 @@ def process_payment():
         else:
             # Returning user: verify ip/state and then do model probability scoring
             score = 0.0
+            # geolocation check
+            geo = get_geo_info(client_ip)
             if state and state != row.get('last_state'):
                 score += 0.4
+            if geo:
+                # small boost if location mismatch
+                city = geo.get('city')
+                region = geo.get('region')
+                country = geo.get('country_name')
+                if region and row.get('last_state') and region != row.get('last_state'):
+                    score += 0.2
             # prepare model features (example)
             features = np.array([[amount, 0, 0, 0, max(0.0, amount/2)]])
             try:
@@ -129,8 +175,13 @@ def process_payment():
             status = 'Fraud Flagged' if final >= 0.6 else 'Approved'
 
         # log transaction
-        cur.execute("INSERT INTO transaction_logs (user_id, amount, status, ip_address, client_state) VALUES (%s,%s,%s,%s,%s)",
-                    (user_id or row and row.get('user_id'), amount, status, client_ip, state))
+        # support both MySQL param styles and SQLite
+        try:
+            cur.execute("INSERT INTO transaction_logs (user_id, amount, status, ip_address, client_state) VALUES (%s,%s,%s,%s,%s)",
+                        (user_id or (row and row.get('user_id')), amount, status, client_ip, state))
+        except Exception:
+            cur.execute("INSERT INTO transaction_logs (user_id, amount, status, ip_address, client_state) VALUES (?,?,?,?,?)",
+                        (user_id or (row and row.get('user_id')), amount, status, client_ip, state))
         conn.commit()
     finally:
         conn.close()

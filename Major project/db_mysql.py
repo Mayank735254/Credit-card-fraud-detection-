@@ -1,7 +1,8 @@
 import os
-import mysql.connector
-from mysql.connector import errorcode
 from pathlib import Path
+import sqlite3
+
+USE_SQLITE = os.environ.get('USE_SQLITE', '1') == '1'
 
 DB_CONFIG = {
     'host': os.environ.get('DB_HOST', '127.0.0.1'),
@@ -11,56 +12,69 @@ DB_CONFIG = {
     'database': os.environ.get('DB_NAME', 'fraud_db')
 }
 
+BASE_DIR = Path(__file__).resolve().parent
+SQLITE_PATH = BASE_DIR / 'data_fraud.db'
+
 
 def get_conn():
-    return mysql.connector.connect(**DB_CONFIG)
+    """Try MySQL connection if configured and available, otherwise fallback to SQLite."""
+    if not USE_SQLITE:
+        try:
+            import mysql.connector
+            return mysql.connector.connect(**DB_CONFIG)
+        except Exception:
+            pass
+    # fallback sqlite
+    conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    conn = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
+    conn = get_conn()
+    cur = conn.cursor()
+    # Use SQL compatible with both SQLite and MySQL where possible
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS user_profiles (
-            user_id VARCHAR(128) PRIMARY KEY,
+            user_id TEXT PRIMARY KEY,
             encrypted_card TEXT,
-            card_mask VARCHAR(32),
+            card_mask TEXT,
             card_image_path TEXT,
-            last_state VARCHAR(32),
-            avg_spend_limit DOUBLE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB;
-        """)
+            last_state TEXT,
+            avg_spend_limit REAL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
-        cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS transaction_logs (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(128),
-            amount DOUBLE,
-            status VARCHAR(64),
-            ip_address VARCHAR(64),
-            client_state VARCHAR(32),
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB;
-        """)
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            amount REAL,
+            status TEXT,
+            ip_address TEXT,
+            client_state TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
-        cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS user_behaviour (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(128),
-            ip_address VARCHAR(64),
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            ip_address TEXT,
             location TEXT,
             user_agent TEXT,
-            event_type VARCHAR(64),
-            event_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB;
-        """)
+            event_type TEXT,
+            event_time DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
-        conn.commit()
-    except mysql.connector.Error as err:
-        if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
-            raise
-    finally:
-        if conn:
-            conn.close()
+    conn.commit()
+    conn.close()
