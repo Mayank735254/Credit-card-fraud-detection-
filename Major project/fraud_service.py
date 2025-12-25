@@ -1,7 +1,7 @@
 import os
 import logging
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 import joblib
 import numpy as np
 from utils import encrypt_text, decrypt_text, mask_card_number, save_image, luhn_check
@@ -41,10 +41,54 @@ def load_model(path: Path):
 MODEL = load_model(MODEL_PATH)
 
 
+def get_model_input_size():
+    # Try common attributes to determine expected feature count
+    try:
+        if hasattr(MODEL, 'n_features_in_'):
+            return int(MODEL.n_features_in_)
+    except Exception:
+        pass
+    try:
+        booster = MODEL.get_booster()
+        return int(booster.num_feature())
+    except Exception:
+        return None
+
+
+def pad_features(X, expected):
+    if expected is None:
+        return np.asarray(X)
+    arr = np.asarray(X)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[1] < expected:
+        pad = np.zeros((arr.shape[0], expected - arr.shape[1]))
+        arr = np.hstack([arr, pad])
+    return arr
+
+
 def get_client_ip():
     if request.headers.get('X-Forwarded-For'):
         return request.headers.get('X-Forwarded-For').split(',')[0].strip()
     return request.remote_addr or '0.0.0.0'
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+def row_get(row, key, default=None):
+    if row is None:
+        return default
+    try:
+        # dict-like
+        return row.get(key, default)
+    except Exception:
+        try:
+            return row[key]
+        except Exception:
+            return default
 
 
 # Simple in-memory rate limiter per IP (works for single-process)
@@ -102,11 +146,22 @@ def register_user():
 
     conn = get_conn()
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "REPLACE INTO user_profiles (user_id, encrypted_card, card_mask, card_image_path, last_state, avg_spend_limit) VALUES (%s,%s,%s,%s,%s,%s)",
-            (user_id, enc, mask, img_path, state, 1000.0)
-        )
+        try:
+            cur = conn.cursor(dictionary=True)
+        except Exception:
+            cur = conn.cursor()
+
+        # Try MySQL param style first, fall back to SQLite style (?)
+        try:
+            cur.execute(
+                "REPLACE INTO user_profiles (user_id, encrypted_card, card_mask, card_image_path, last_state, avg_spend_limit) VALUES (%s,%s,%s,%s,%s,%s)",
+                (user_id, enc, mask, img_path, state, 1000.0)
+            )
+        except Exception:
+            cur.execute(
+                "REPLACE INTO user_profiles (user_id, encrypted_card, card_mask, card_image_path, last_state, avg_spend_limit) VALUES (?,?,?,?,?,?)",
+                (user_id, enc, mask, img_path, state, 1000.0)
+            )
         conn.commit()
     finally:
         conn.close()
@@ -128,45 +183,64 @@ def process_payment():
     # Check if user exists by user_id or card number
     conn = get_conn()
     try:
-        cur = conn.cursor(dictionary=True)
+        try:
+            cur = conn.cursor(dictionary=True)
+        except Exception:
+            cur = conn.cursor()
+
+        row = None
         if user_id:
-            cur.execute("SELECT * FROM user_profiles WHERE user_id=%s", (user_id,))
-            row = cur.fetchone()
+            try:
+                cur.execute("SELECT * FROM user_profiles WHERE user_id=%s", (user_id,))
+                row = cur.fetchone()
+            except Exception:
+                cur.execute("SELECT * FROM user_profiles WHERE user_id=?", (user_id,))
+                row = cur.fetchone()
         elif card_num:
             mask = mask_card_number(card_num)
-            cur.execute("SELECT * FROM user_profiles WHERE card_mask=%s", (mask,))
-            row = cur.fetchone()
-        else:
-            row = None
+            try:
+                cur.execute("SELECT * FROM user_profiles WHERE card_mask=%s", (mask,))
+                row = cur.fetchone()
+            except Exception:
+                cur.execute("SELECT * FROM user_profiles WHERE card_mask=?", (mask,))
+                row = cur.fetchone()
 
         if not row:
             # First time user: quick ML check based on features only
             features = np.array([[amount, 0, 0, 0, max(0.0, amount/2)]])
+            expected = get_model_input_size()
+            features = pad_features(features, expected)
             pred = int(MODEL.predict(features)[0])
             status = 'Fraud' if pred != 0 else 'Approved'
             # store minimal profile if approved
             if status == 'Approved' and user_id and card_num:
                 enc = encrypt_text('|'.join([card_num, '', '']))
                 mask = mask_card_number(card_num)
-                cur.execute("INSERT INTO user_profiles (user_id, encrypted_card, card_mask, last_state, avg_spend_limit) VALUES (%s,%s,%s,%s,%s)",
-                            (user_id, enc, mask, state, amount*1.5))
+                try:
+                    cur.execute("INSERT INTO user_profiles (user_id, encrypted_card, card_mask, last_state, avg_spend_limit) VALUES (%s,%s,%s,%s,%s)",
+                                (user_id, enc, mask, state, amount*1.5))
+                except Exception:
+                    cur.execute("INSERT INTO user_profiles (user_id, encrypted_card, card_mask, last_state, avg_spend_limit) VALUES (?,?,?,?,?)",
+                                (user_id, enc, mask, state, amount*1.5))
                 conn.commit()
         else:
             # Returning user: verify ip/state and then do model probability scoring
             score = 0.0
             # geolocation check
             geo = get_geo_info(client_ip)
-            if state and state != row.get('last_state'):
+            if state and state != row_get(row,'last_state'):
                 score += 0.4
             if geo:
                 # small boost if location mismatch
                 city = geo.get('city')
                 region = geo.get('region')
                 country = geo.get('country_name')
-                if region and row.get('last_state') and region != row.get('last_state'):
+                if region and row_get(row,'last_state') and region != row_get(row,'last_state'):
                     score += 0.2
             # prepare model features (example)
             features = np.array([[amount, 0, 0, 0, max(0.0, amount/2)]])
+            expected = get_model_input_size()
+            features = pad_features(features, expected)
             try:
                 ml_prob = float(MODEL.predict_proba(features)[0][1])
             except Exception:
