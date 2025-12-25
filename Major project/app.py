@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template
@@ -29,19 +30,15 @@ def load_model(path: Path):
     except Exception:
         class DummyModel:
             def predict(self, X):
-                try:
-                    n = len(X)
-                except Exception:
-                    n = 1
+                arr = np.asarray(X)
+                n = arr.shape[0] if arr.ndim > 0 else 1
                 return np.zeros((n,), dtype=int)
             def predict_proba(self, X):
-                try:
-                    n = len(X)
-                except Exception:
-                    n = 1
+                arr = np.asarray(X)
+                n = arr.shape[0] if arr.ndim > 0 else 1
                 # columns: [prob_not_fraud, prob_fraud]
                 return np.vstack([np.ones(n) * 0.99, np.ones(n) * 0.01]).T
-        print("Warning: model file not found — using DummyModel for local testing.")
+        logging.warning("model file not found — using DummyModel for local testing.")
         return DummyModel()
 
 MODEL = load_model(MODEL_PATH)
@@ -120,39 +117,40 @@ def process_payment():
 
     conn = get_db_connection()
     cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
+        user_row = cur.fetchone()
+        user_record = dict(user_row) if user_row else None
 
-    cur.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
-    user_row = cur.fetchone()
-    user_record = dict(user_row) if user_row else None
+        now = datetime.now()
+        ml_input = np.array([[amount, now.hour, now.weekday(), now.month, max(0.0, amount/2)]])
 
-    now = datetime.now()
-    ml_input = np.array([[amount, now.hour, now.weekday(), now.month, max(0.0, amount/2)]])
+        if not user_record:
+            pred = int(MODEL.predict(ml_input)[0])
+            status = 'Approved' if pred == 0 else 'Fraud'
+            if status == 'Approved':
+                enc_card = encrypt_data(card_num)
+                cur.execute(
+                    "INSERT OR REPLACE INTO user_profiles (user_id, encrypted_card, last_state, avg_spend_limit) VALUES (?, ?, ?, ?)",
+                    (user_id, enc_card, state, amount * 1.5)
+                )
+                conn.commit()
+        else:
+            bla_score = 0.0
+            if state and state != user_record.get('last_state'):
+                bla_score += 0.5
+            try:
+                ml_prob = float(MODEL.predict_proba(ml_input)[0][1])
+            except Exception:
+                ml_pred = int(MODEL.predict(ml_input)[0])
+                ml_prob = 0.0 if ml_pred == 0 else 1.0
+            final_score = ml_prob * 0.6 + bla_score * 0.4
+            status = 'Approved' if final_score < 0.6 else 'Fraud Flagged'
 
-    if not user_record:
-        pred = int(MODEL.predict(ml_input)[0])
-        status = 'Approved' if pred == 0 else 'Fraud'
-        if status == 'Approved':
-            enc_card = encrypt_data(card_num)
-            cur.execute(
-                "INSERT OR REPLACE INTO user_profiles (user_id, encrypted_card, last_state, avg_spend_limit) VALUES (?, ?, ?, ?)",
-                (user_id, enc_card, state, amount * 1.5)
-            )
-            conn.commit()
-    else:
-        bla_score = 0.0
-        if state and state != user_record.get('last_state'):
-            bla_score += 0.5
-        try:
-            ml_prob = float(MODEL.predict_proba(ml_input)[0][1])
-        except Exception:
-            ml_pred = int(MODEL.predict(ml_input)[0])
-            ml_prob = 0.0 if ml_pred == 0 else 1.0
-        final_score = ml_prob * 0.6 + bla_score * 0.4
-        status = 'Approved' if final_score < 0.6 else 'Fraud Flagged'
-
-    cur.execute("INSERT INTO transaction_logs (user_id, amount, status) VALUES (?, ?, ?)", (user_id, amount, status))
-    conn.commit()
-    conn.close()
+        cur.execute("INSERT INTO transaction_logs (user_id, amount, status) VALUES (?, ?, ?)", (user_id, amount, status))
+        conn.commit()
+    finally:
+        conn.close()
 
     return jsonify({'status': status, 'user_type': 'New' if not user_record else 'Returning', 'message': f'Payment {status}'})
 
