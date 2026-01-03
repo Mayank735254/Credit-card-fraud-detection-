@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Make Payment</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .card { border-radius: 15px; border: none; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="row justify-content-center">
+            <div class="col-md-6">
+                <div class="card mt-5">
+                    <div class="card-body p-4">
+                        <h2 class="text-center mb-4">💳 Make Payment</h2>
+                        
+                        <div id="alertBox" class="alert d-none"></div>
+                        
+                        <form id="paymentForm">
+                            <div class="mb-3">
+                                <label class="form-label">User ID *</label>
+                                <input type="text" id="user_id" class="form-control" required>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Card Number *</label>
+                                <input type="text" id="card_no" class="form-control" 
+                                       placeholder="1234 5678 9012 3456" maxlength="19" required>
+                            </div>
+                            
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label class="form-label">Expiry Date *</label>
+                                    <input type="text" id="expiry_date" class="form-control" 
+                                           placeholder="MM/YY" maxlength="5" required>
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <label class="form-label">CVV *</label>
+                                    <input type="text" id="cvv" class="form-control" 
+                                           placeholder="123" maxlength="4" required>
+                                </div>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Email *</label>
+                                <input type="email" id="email" class="form-control" required>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Amount ($) *</label>
+                                <input type="number" id="amount" class="form-control" 
+                                       step="0.01" min="0.01" required>
+                            </div>
+                            
+                            <button type="submit" class="btn btn-primary w-100">Submit Payment</button>
+                            <a href="/" class="btn btn-link w-100 mt-2">Back to Home</a>
+                        </form>
+                        
+                        <!-- OTP Verification Modal -->
+                        <div class="modal fade" id="otpModal" tabindex="-1">
+                            <div class="modal-dialog">
+                                <div class="modal-content">
+                                    <div class="modal-header">
+                                        <h5 class="modal-title">OTP Verification</h5>
+                                    </div>
+                                    <div class="modal-body">
+                                        <p>OTP has been sent to your registered email/mobile.</p>
+                                        <input type="text" id="otp_code" class="form-control" 
+                                               placeholder="Enter 6-digit OTP" maxlength="6">
+                                    </div>
+                                    <div class="modal-footer">
+                                        <button type="button" class="btn btn-primary" onclick="verifyOTP()">Verify OTP</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentTransactionId = null;
+        let userLocation = null;
+        
+        // Get user location and convert to city name
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+                async (position) => {
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    console.log('Coordinates captured:', lat, lon);
+                    
+                    // Convert coordinates to city name using reverse geocoding
+                    try {
+                        // Using OpenStreetMap Nominatim API (free, no key required)
+                        const response = await fetch(
+                            `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&addressdetails=1`
+                        );
+                        const data = await response.json();
+                        if (data && data.address) {
+                            // Try to get city name
+                            userLocation = data.address.city || 
+                                         data.address.town || 
+                                         data.address.village || 
+                                         data.address.county || 
+                                         'Unknown';
+                            console.log('City name:', userLocation);
+                        } else {
+                            userLocation = 'Unknown';
+                        }
+                    } catch (error) {
+                        console.log('Reverse geocoding failed:', error);
+                        userLocation = 'Unknown';
+                    }
+                },
+                (error) => {
+                    console.log('Location access denied, using default');
+                    userLocation = 'Unknown';
+                }
+            );
+        }
+        
+        // Generate device ID
+        const deviceId = navigator.userAgent + '_' + screen.width + 'x' + screen.height;
+        
+        document.getElementById('paymentForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const alertBox = document.getElementById('alertBox');
+            alertBox.className = 'alert alert-info';
+            alertBox.innerText = 'Processing payment...';
+            alertBox.classList.remove('d-none');
+            
+            const formData = {
+                user_id: document.getElementById('user_id').value,
+                card_no: document.getElementById('card_no').value.replace(/\s/g, ''),
+                expiry_date: document.getElementById('expiry_date').value,
+                cvv: document.getElementById('cvv').value,
+                email: document.getElementById('email').value,
+                amount: parseFloat(document.getElementById('amount').value),
+                location: userLocation || 'Unknown',
+                device_id: deviceId
+            };
+            
+            try {
+                const response = await fetch('/api/payment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(formData)
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    if (result.status === 'Approved') {
+                        alertBox.className = 'alert alert-success';
+                        alertBox.innerHTML = `<strong>Success!</strong> ${result.message}<br>
+                            Fraud Score: ${result.fraud_score}<br>
+                            Method: ${result.method || 'ML+BLA'}`;
+                    } else if (result.status === 'OTP_Sent') {
+                        currentTransactionId = result.transaction_id;
+                        alertBox.className = 'alert alert-warning';
+                        alertBox.innerHTML = `<strong>OTP Required!</strong> ${result.message}<br>
+                            Fraud Score: ${result.fraud_score}`;
+                        // Show OTP modal
+                        const modal = new bootstrap.Modal(document.getElementById('otpModal'));
+                        modal.show();
+                    } else if (result.status === 'Blocked') {
+                        alertBox.className = 'alert alert-danger';
+                        alertBox.innerHTML = `<strong>Blocked!</strong> ${result.message}<br>
+                            Fraud Score: ${result.fraud_score}`;
+                    }
+                } else {
+                    alertBox.className = 'alert alert-danger';
+                    alertBox.innerText = result.message;
+                }
+            } catch (error) {
+                alertBox.className = 'alert alert-danger';
+                alertBox.innerText = 'Payment failed: ' + error.message;
+            }
+        });
+        
+        async function verifyOTP() {
+            const otpCode = document.getElementById('otp_code').value;
+            
+            if (!otpCode || otpCode.length !== 6) {
+                alert('Please enter a valid 6-digit OTP');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/verify_otp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        transaction_id: currentTransactionId,
+                        otp_code: otpCode
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('OTP verified! Transaction approved.');
+                    document.getElementById('otpModal').querySelector('.btn-close').click();
+                    document.getElementById('paymentForm').reset();
+                } else {
+                    alert(result.message);
+                }
+            } catch (error) {
+                alert('OTP verification failed: ' + error.message);
+            }
+        }
+        
+        // Format card number
+        document.getElementById('card_no').addEventListener('input', (e) => {
+            let value = e.target.value.replace(/\s/g, '');
+            let formatted = value.match(/.{1,4}/g)?.join(' ') || value;
+            e.target.value = formatted;
+        });
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+
